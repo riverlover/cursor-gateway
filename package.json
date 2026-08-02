@@ -1,0 +1,35 @@
+{
+  "name": "cursor-gateway",
+  "version": "1.0.0",
+  "description": "Cursor IDE JWT Token Gateway - exposes Cursor's backend APIs as OpenAI-compatible endpoints",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "cursor-gateway": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "node --import tsx src/index.ts"
+  },
+  "keywords": [
+    "cursor",
+    "gateway",
+    "proxy",
+    "openai"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.1.2",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
+  }
+}
