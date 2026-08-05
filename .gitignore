@@ -5,3 +5,7 @@ dist/
 *.log
 .DS_Store
 hud/*.exe
+hud/macos/.build/
+hud/macos/CursorUsageHud
+hud/macos/CursorUsageHud.app/
+hud/macos/.swiftpm/

@@ -290,16 +290,27 @@ sealed class HudForm : Form
             var cached = Native.ReadItem(_db, "cursorAuth/cachedEmail");
             var sub = JwtClaim(jwt, "sub");
 
-            // Email from official AuthService matches the JWT used for usage.
-            string email = "";
-            try { email = ExtractString(PostJson(jwt, "https://api2.cursor.sh/aiserver.v1.AuthService/GetEmail"), "email"); }
-            catch { }
-            if (string.IsNullOrEmpty(email)) email = cached;
+            // Prefer cachedEmail — matches Cursor IDE settings UI.
+            // GetEmail can return a different signup/Google address for the same session.
+            string email = cached;
+            if (string.IsNullOrEmpty(email))
+            {
+                try { email = ExtractString(PostJson(jwt, "https://api2.cursor.sh/aiserver.v1.AuthService/GetEmail"), "email"); }
+                catch { }
+            }
             if (string.IsNullOrEmpty(email)) email = JwtClaim(jwt, "email");
             if (string.IsNullOrEmpty(email)) email = ShortSub(sub);
 
             var switched = !string.IsNullOrEmpty(sub) && _lastSub != "" && sub != _lastSub;
             _lastSub = sub ?? "";
+
+            // Server GetPlanInfo.planName is authoritative; local stripeMembershipType is often stale.
+            try
+            {
+                var planName = ExtractString(PostJson(jwt, "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo"), "planName");
+                if (!string.IsNullOrEmpty(planName)) membership = planName.ToLowerInvariant();
+            }
+            catch { }
 
             var json = PostJson(jwt, "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage");
             var used = ParseDouble(json, "totalPercentUsed");
@@ -442,22 +453,37 @@ static class Program
         {
             var jwt = Native.ReadItem(db, "cursorAuth/accessToken");
             if (string.IsNullOrWhiteSpace(jwt)) throw new Exception("no accessToken");
-            var email = "";
+            var email = Native.ReadItem(db, "cursorAuth/cachedEmail");
+            if (string.IsNullOrEmpty(email))
+            {
+                try
+                {
+                    var m = Regex.Match(HudForm.PostGetEmail(jwt), "\"email\"\\s*:\\s*\"([^\"]+)\"");
+                    if (m.Success) email = m.Groups[1].Value;
+                }
+                catch { }
+            }
+            var cachedMembership = Native.ReadItem(db, "cursorAuth/stripeMembershipType");
+            var membership = cachedMembership;
+            var planJson = "";
             try
             {
-                var m = Regex.Match(HudForm.PostGetEmail(jwt), "\"email\"\\s*:\\s*\"([^\"]+)\"");
-                if (m.Success) email = m.Groups[1].Value;
+                planJson = HudForm.PostJson(jwt, "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo");
+                var planName = Regex.Match(planJson, "\"planName\"\\s*:\\s*\"([^\"]+)\"");
+                if (planName.Success) membership = planName.Groups[1].Value.ToLowerInvariant();
             }
             catch { }
-            if (string.IsNullOrEmpty(email))
-                email = Native.ReadItem(db, "cursorAuth/cachedEmail");
-            var membership = Native.ReadItem(db, "cursorAuth/stripeMembershipType");
             var json = HudForm.PostUsage(jwt);
             var used = HudForm.ParseDouble(json, "totalPercentUsed");
             Console.WriteLine("email=" + email);
             Console.WriteLine("plan=" + membership);
+            Console.WriteLine("db_stripeMembershipType=" + cachedMembership);
             Console.WriteLine("used=" + used.ToString(System.Globalization.CultureInfo.InvariantCulture) + "%");
             Console.WriteLine("remaining=" + (100.0 - used).ToString(System.Globalization.CultureInfo.InvariantCulture) + "%");
+            Console.WriteLine("--- GetPlanInfo ---");
+            Console.WriteLine(string.IsNullOrEmpty(planJson) ? "(empty)" : planJson);
+            Console.WriteLine("--- GetCurrentPeriodUsage ---");
+            Console.WriteLine(json);
         }
         catch (Exception ex)
         {
