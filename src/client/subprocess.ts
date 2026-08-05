@@ -1,15 +1,13 @@
 /**
  * Cursor CLI (agent) Subprocess Manager.
  *
- * Spawns `cursor-agent -p --output-format stream-json --stream-partial-output --yolo`
+ * Spawns `cursor-agent -p --mode ask --output-format stream-json --stream-partial-output`
  * and emits normalized events: content_delta, result, error, close.
  *
- * The prompt is piped via stdin to avoid shell argument length limits.
- *
- * Event lifecycle:
- *   start → [system] → [assistant content_delta*] → result → close
- *   start → [error] → close
- *   start → [tool_call] → [assistant content_delta*] → result → close
+ * Supports two-phase use for warm pooling:
+ *   prepare(options) → run(prompt)
+ * Or one-shot:
+ *   start(prompt, options)
  */
 
 import { spawn, ChildProcess } from "child_process";
@@ -19,13 +17,21 @@ import { existsSync } from "fs";
 const IS_WIN = process.platform === "win32";
 const DEFAULT_TIMEOUT = 300_000; // 5 minutes
 
+export type AgentMode = "ask" | "plan" | "agent";
+
+function resolveAgentMode(): AgentMode {
+  const raw = (process.env.AGENT_MODE || "ask").toLowerCase();
+  if (raw === "plan" || raw === "agent" || raw === "ask") return raw;
+  return "ask";
+}
+
 // Try multiple possible agent CLI locations
 function findAgentCli(): string {
   const paths = [
     process.env.CURSOR_AGENT_BIN,
     "/Users/lizhenhe/.local/share/cursor-agent/versions/2026.07.23-e383d2b/cursor-agent",
     "/Users/lizhenhe/.cursor-dev/resources/app/out/cursor-agent",
-    "agent",  // fallback to PATH
+    "agent", // fallback to PATH
   ].filter(Boolean) as string[];
 
   for (const path of paths) {
@@ -36,7 +42,7 @@ function findAgentCli(): string {
   return "agent";
 }
 
-const AGENT_BIN = findAgentCli();
+export const AGENT_BIN = findAgentCli();
 console.log(`[CursorGateway] Using agent CLI: ${AGENT_BIN}`);
 
 export interface SubprocessOptions {
@@ -44,6 +50,8 @@ export interface SubprocessOptions {
   apiKey?: string;
   cwd?: string;
   timeout?: number;
+  /** Override AGENT_MODE for this spawn */
+  mode?: AgentMode;
 }
 
 export interface ContentDeltaEvent {
@@ -62,6 +70,42 @@ interface ToolCallMsg { type: "tool_call"; }
 interface ResultMsg { type: "result"; result?: string; }
 type CliMessage = SystemInit | AssistantMsg | ToolCallMsg | ResultMsg;
 
+export function buildAgentArgs(options: SubprocessOptions): string[] {
+  const mode = options.mode ?? resolveAgentMode();
+  const args = [
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--stream-partial-output",
+  ];
+
+  // ask/plan are read-only Q&A; agent mode keeps tool execution (--yolo/--force)
+  if (mode === "ask" || mode === "plan") {
+    args.push("--mode", mode, "--trust");
+  } else {
+    args.push("--yolo", "--trust");
+  }
+
+  if (options.model && options.model !== "auto") {
+    args.push("--model", options.model);
+  }
+  return args;
+}
+
+export function buildAgentEnv(apiKey?: string): NodeJS.ProcessEnv {
+  const agentDir = AGENT_BIN.includes("/") ? AGENT_BIN.split("/").slice(0, -1).join("/") : undefined;
+  const env: NodeJS.ProcessEnv = agentDir
+    ? { ...process.env, PATH: `${agentDir}:${process.env.PATH || ""}` }
+    : { ...process.env };
+
+  if (apiKey) {
+    env.CURSOR_API_KEY = apiKey;
+  } else {
+    delete env.CURSOR_API_KEY;
+  }
+  return env;
+}
+
 export class CursorSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer = "";
@@ -69,29 +113,42 @@ export class CursorSubprocess extends EventEmitter {
   private isKilled = false;
   private detectedModel = "cursor-auto";
   private turnBuffer = "";
+  private prepared = false;
+  private running = false;
+  private options: SubprocessOptions | null = null;
 
-  async start(prompt: string, options: SubprocessOptions): Promise<void> {
-    const args = this.buildArgs(options);
-    const timeout = options.timeout ?? DEFAULT_TIMEOUT;
+  /** Model this worker was prepared with (for pool matching). */
+  get model(): string {
+    return this.options?.model || "auto";
+  }
+
+  get apiKey(): string | undefined {
+    return this.options?.apiKey;
+  }
+
+  get pid(): number | undefined {
+    return this.process?.pid;
+  }
+
+  get isPrepared(): boolean {
+    return this.prepared && !this.running && !this.isKilled && !!this.process;
+  }
+
+  /**
+   * Spawn the agent and leave stdin open (warm idle).
+   * Call `run(prompt)` later to feed the prompt.
+   */
+  async prepare(options: SubprocessOptions): Promise<void> {
+    if (this.prepared || this.process) {
+      throw new Error("Subprocess already prepared");
+    }
+    this.options = options;
+    const args = buildAgentArgs(options);
+    const env = buildAgentEnv(options.apiKey);
 
     return new Promise<void>((resolve, reject) => {
       try {
-        // Set up environment with agent directory in PATH
-        const agentDir = AGENT_BIN.includes('/') ? AGENT_BIN.split('/').slice(0, -1).join('/') : undefined;
-        const env = agentDir
-          ? { ...process.env, PATH: `${agentDir}:${process.env.PATH || ''}` }
-          : { ...process.env };
-
-        // Prefer explicit API key; otherwise force CLI to use local `agent login` OAuth.
-        // Always strip inherited CURSOR_API_KEY so placeholder/invalid keys from clients
-        // (or parent shells) cannot poison authentication.
-        if (options.apiKey) {
-          env.CURSOR_API_KEY = options.apiKey;
-        } else {
-          delete env.CURSOR_API_KEY;
-        }
-
-        console.log(`[subprocess] Spawning: ${AGENT_BIN} ${args.join(' ')}`);
+        console.log(`[subprocess] Preparing: ${AGENT_BIN} ${args.join(" ")}`);
 
         this.process = spawn(AGENT_BIN, args, {
           cwd: options.cwd ?? process.cwd(),
@@ -100,21 +157,15 @@ export class CursorSubprocess extends EventEmitter {
           shell: IS_WIN,
         });
 
-        this.timeoutId = setTimeout(() => {
-          if (!this.isKilled) {
-            this.isKilled = true;
-            this.process?.kill("SIGTERM");
-            this.emit("error", new Error(`Request timed out after ${timeout}ms`));
-          }
-        }, timeout);
-
         this.process.on("error", (err) => {
           this.clearTimer();
-          reject(new Error(`Failed to start agent: ${err.message}`));
+          this.prepared = false;
+          if (!this.running) {
+            reject(new Error(`Failed to start agent: ${err.message}`));
+          } else {
+            this.emit("error", new Error(`Failed to start agent: ${err.message}`));
+          }
         });
-
-        this.process.stdin?.write(prompt);
-        this.process.stdin?.end();
 
         this.process.stdout?.on("data", (chunk: Buffer) => {
           this.buffer += chunk.toString();
@@ -129,10 +180,14 @@ export class CursorSubprocess extends EventEmitter {
         this.process.on("close", (code) => {
           this.clearTimer();
           if (this.buffer.trim()) this.processBuffer();
+          this.prepared = false;
+          this.running = false;
           this.emit("close", code);
         });
 
-        resolve();
+        this.prepared = true;
+        // Resolve on next tick so the process is actually spawned
+        setImmediate(() => resolve());
       } catch (err) {
         this.clearTimer();
         reject(err);
@@ -140,18 +195,41 @@ export class CursorSubprocess extends EventEmitter {
     });
   }
 
-  private buildArgs(options: SubprocessOptions): string[] {
-    const args = [
-      "-p",
-      "--output-format",
-      "stream-json",
-      "--stream-partial-output",
-      "--yolo",
-    ];
-    if (options.model && options.model !== "auto") {
-      args.push("--model", options.model);
+  /**
+   * Feed prompt into a prepared worker and start the request timeout.
+   */
+  async run(prompt: string): Promise<void> {
+    if (!this.process || !this.prepared) {
+      throw new Error("Subprocess not prepared; call prepare() first");
     }
-    return args;
+    if (this.running) {
+      throw new Error("Subprocess already running");
+    }
+
+    const timeout = this.options?.timeout ?? DEFAULT_TIMEOUT;
+    this.running = true;
+    this.isKilled = false;
+    this.turnBuffer = "";
+    this.detectedModel = this.options?.model && this.options.model !== "auto"
+      ? this.options.model
+      : "cursor-auto";
+
+    this.timeoutId = setTimeout(() => {
+      if (!this.isKilled) {
+        this.isKilled = true;
+        this.process?.kill("SIGTERM");
+        this.emit("error", new Error(`Request timed out after ${timeout}ms`));
+      }
+    }, timeout);
+
+    this.process.stdin?.write(prompt);
+    this.process.stdin?.end();
+  }
+
+  /** One-shot: prepare + run (fallback when pool is unavailable). */
+  async start(prompt: string, options: SubprocessOptions): Promise<void> {
+    await this.prepare(options);
+    await this.run(prompt);
   }
 
   private processBuffer(): void {
@@ -170,7 +248,7 @@ export class CursorSubprocess extends EventEmitter {
 
   private handleMessage(msg: CliMessage): void {
     if (msg.type === "system" && (msg as SystemInit).model) {
-      this.detectedModel = (msg as SystemInit).model;
+      this.detectedModel = (msg as SystemInit).model!;
       return;
     }
 
@@ -207,7 +285,10 @@ export class CursorSubprocess extends EventEmitter {
   }
 
   private clearTimer(): void {
-    if (this.timeoutId) { clearTimeout(this.timeoutId); this.timeoutId = null; }
+    if (this.timeoutId) {
+      clearTimeout(this.timeoutId);
+      this.timeoutId = null;
+    }
   }
 
   kill(): void {

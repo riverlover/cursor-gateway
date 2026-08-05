@@ -4,15 +4,15 @@
  * Architecture:
  *   /api/usage  → DashboardClient (HTTP/JSON to api2.cursor.sh with JWT)
  *   /v1/models  → Static model list from known Cursor models
- *   /v1/chat    → CursorSubprocess (agent CLI subprocess)
- *   /health     → Health check with token validation
+ *   /v1/chat    → AgentPool (warm ask-mode CLI workers)
+ *   /health     → Health check with token validation + pool stats
  */
 
 import { v4 as uuidv4 } from "uuid";
 import type { Request, Response } from "express";
 import { CursorSubprocess } from "../client/subprocess.js";
 import type { ContentDeltaEvent, ResultEvent } from "../client/subprocess.js";
-import { DashboardClient } from "../client/dashboard.js";
+import { getAgentPool } from "../client/agent-pool.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import { createStreamChunk, createDoneChunk, createChatResponse } from "../adapter/cli-to-openai.js";
 import { verifyCursorCli } from "../client/subprocess.js";
@@ -67,6 +67,8 @@ export async function handleChatCompletions(
   const requestId = uuidv4().replace(/-/g, "").slice(0, 24);
   const body = req.body as ChatCompletionRequest;
   const stream = body.stream === true;
+  const pool = getAgentPool();
+  let worker: CursorSubprocess | null = null;
 
   try {
     if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
@@ -79,20 +81,30 @@ export async function handleChatCompletions(
     const { prompt, model } = openaiToCli(body);
     const apiKey = extractApiKey(req);
     console.log(
-      `[chat] id=${requestId} model=${body.model} -> cli=${model} stream=${stream} apiKey=${apiKey ? "provided" : "none(local-oauth)"}`
+      `[chat] id=${requestId} model=${body.model} -> cli=${model} stream=${stream} apiKey=${apiKey ? "provided" : "none(local-oauth)"} pool=${JSON.stringify(pool.stats())}`
     );
 
-    const subprocess = new CursorSubprocess();
+    try {
+      worker = await pool.acquire({ model, apiKey });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(503).json({
+        error: { message: msg, type: "server_error", code: "agent_pool_unavailable" },
+      });
+      return;
+    }
 
     if (stream) {
-      await handleStreaming(res, subprocess, prompt, model, requestId, apiKey);
+      await handleStreaming(res, worker, prompt, model, requestId);
     } else {
-      await handleNonStreaming(res, subprocess, prompt, model, requestId, apiKey);
+      await handleNonStreaming(res, worker, prompt, model, requestId);
     }
   } catch (error) {
     const msg = error instanceof Error ? error.message : "Unknown error";
     console.error("[chat] Error:", msg);
     if (!res.headersSent) res.status(500).json({ error: { message: msg, type: "server_error", code: null } });
+  } finally {
+    if (worker) pool.release(worker);
   }
 }
 
@@ -165,6 +177,8 @@ export async function handleHealth(
     provider: "cursor-gateway",
     port: parseInt(process.env.PORT || String(DEFAULT_PORT), 10),
     timestamp: new Date().toISOString(),
+    agent_pool: getAgentPool().stats(),
+    agent_mode: process.env.AGENT_MODE || "ask",
   };
 
   try {
@@ -191,7 +205,12 @@ export async function handleHealth(
     health.agent_cli_status = "disconnected";
   }
 
-  const code = health.status === "healthy" ? 200 : health.status === "degraded" ? 200 : 503;
+  const pool = health.agent_pool;
+  if (pool && pool.idle < 1 && pool.inFlight < 1) {
+    health.status = "degraded";
+  }
+
+  const code = health.status === "healthy" || health.status === "degraded" ? 200 : 503;
   res.status(code).json(health);
 }
 
@@ -199,7 +218,7 @@ export async function handleHealth(
 
 async function handleStreaming(
   res: Response, subprocess: CursorSubprocess,
-  prompt: string, model: string, requestId: string, apiKey?: string
+  prompt: string, model: string, requestId: string
 ): Promise<void> {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -211,8 +230,18 @@ async function handleStreaming(
     let isFirst = true;
     let lastModel = model;
     let isComplete = false;
+    let settled = false;
 
-    res.on("close", () => { if (!isComplete) subprocess.kill(); resolve(); });
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+
+    res.on("close", () => {
+      if (!isComplete) subprocess.kill();
+      finish();
+    });
 
     subprocess.on("content_delta", (delta: ContentDeltaEvent) => {
       if (delta.text && !res.writableEnded) {
@@ -230,7 +259,7 @@ async function handleStreaming(
         res.write("data: [DONE]\n\n");
         res.end();
       }
-      resolve();
+      finish();
     });
 
     subprocess.on("error", (error: Error) => {
@@ -239,54 +268,67 @@ async function handleStreaming(
         res.write(`data: ${JSON.stringify({ error: { message: error.message, type: "server_error", code: null } })}\n\n`);
         res.end();
       }
-      resolve();
+      finish();
     });
 
-    subprocess.on("close", (code: number | null) => {
+    subprocess.on("close", (_code: number | null) => {
       if (!res.writableEnded && !isComplete) {
         res.write("data: [DONE]\n\n");
         res.end();
       }
-      resolve();
+      finish();
     });
 
-    subprocess.start(prompt, { model, apiKey }).catch((err) => {
-      console.error("[stream] Start error:", err);
+    subprocess.run(prompt).catch((err) => {
+      console.error("[stream] Run error:", err);
       if (!res.writableEnded) {
         res.write(`data: ${JSON.stringify({ error: { message: err instanceof Error ? err.message : String(err), type: "server_error", code: null } })}\n\n`);
         res.end();
       }
-      resolve();
+      finish();
     });
   });
 }
 
 async function handleNonStreaming(
   res: Response, subprocess: CursorSubprocess,
-  prompt: string, model: string, requestId: string, apiKey?: string
+  prompt: string, model: string, requestId: string
 ): Promise<void> {
   return new Promise<void>((resolve) => {
     let finalResult: ResultEvent | null = null;
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
 
     subprocess.on("result", (result: ResultEvent) => { finalResult = result; });
     subprocess.on("error", (error: Error) => {
       console.error("[non-stream] Error:", error.message);
       if (!res.headersSent) res.status(500).json({ error: { message: error.message, type: "server_error", code: null } });
-      resolve();
+      finish();
     });
 
     subprocess.on("close", () => {
       if (finalResult) {
-        res.json(createChatResponse(requestId, finalResult.model || model, finalResult.text));
+        if (!res.headersSent) {
+          res.json(createChatResponse(requestId, finalResult.model || model, finalResult.text));
+        }
       } else if (!res.headersSent) {
         res.status(500).json({ error: { message: "CLI exited without result", type: "server_error", code: null } });
       }
-      resolve();
+      finish();
     });
 
-    subprocess.start(prompt, { model, apiKey }).catch((error) => {
-      if (!res.headersSent) res.status(500).json({ error: { message: error instanceof Error ? error.message : String(error), type: "server_error", code: null } });
-      resolve();
+    subprocess.run(prompt).catch((error) => {
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: { message: error instanceof Error ? error.message : String(error), type: "server_error", code: null },
+        });
+      }
+      finish();
     });
   });
 }

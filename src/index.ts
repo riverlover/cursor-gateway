@@ -5,7 +5,7 @@
  *
  * Architecture:
  *   - JWT Token (Auth0) → api2.cursor.sh via HTTP/JSON for /api/usage, /v1/models
- *   - Agent CLI subprocess → local `agent` binary for /v1/chat/completions
+ *   - Warm AgentPool (ask-mode CLI) → local `agent` binary for /v1/chat/completions
  *
  * Usage:
  *   export CURSOR_JWT="<your-jwt-from-state.vscdb>"
@@ -15,6 +15,7 @@
 import express from "express";
 import type { Server } from "http";
 import { DashboardClient } from "./client/dashboard.js";
+import { getAgentPool } from "./client/agent-pool.js";
 import {
   handleChatCompletions,
   handleUsage,
@@ -38,6 +39,9 @@ function getJwtToken(): string {
 async function main() {
   const jwt = getJwtToken();
   const dashboard = new DashboardClient(jwt);
+  const pool = getAgentPool();
+  await pool.start();
+
   const app = express();
 
   app.use(express.json({ limit: "10mb" }));
@@ -61,20 +65,32 @@ async function main() {
     res.status(404).json({ error: { message: "Not found", type: "invalid_request_error", code: "not_found" } });
   });
 
-  return new Promise<Server>((resolve) => {
-    const server = app.listen(PORT, () => {
+  const server = await new Promise<Server>((resolve) => {
+    const s = app.listen(PORT, () => {
       console.log(`✅ Cursor Gateway running on http://localhost:${PORT}`);
       console.log(`   /health          - Health check + token validation`);
       console.log(`   /api/usage       - Cursor account usage (JWT auth)`);
       console.log(`   /v1/models       - Available models (OpenAI-compatible)`);
-      console.log(`   /v1/chat/completions - Chat completions (OpenAI-compatible)`);
+      console.log(`   /v1/chat/completions - Chat completions (warm agent pool)`);
       console.log("");
+      console.log(`   Agent pool: ${JSON.stringify(pool.stats())} mode=${process.env.AGENT_MODE || "ask"}`);
       console.log(`   Usage as OpenAI proxy:`);
       console.log(`     BASE_URL=http://localhost:${PORT}/v1`);
       console.log(`     API_KEY=not-needed`);
-      resolve(server);
+      resolve(s);
     });
   });
+
+  const shutdown = async (signal: string) => {
+    console.log(`\n[${signal}] Shutting down...`);
+    await pool.stop();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  };
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+  return server;
 }
 
 main().catch((err) => {
