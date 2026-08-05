@@ -136,6 +136,10 @@ open CursorUsageHud.app
 
 # One-shot CLI dump
 ./CursorUsageHud --once
+
+# DMG for distribution (ad-hoc signed; recipients may need right-click → Open)
+./package-dmg.sh
+# → CursorUsageHud.dmg
 ```
 
 ### Windows

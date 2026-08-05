@@ -8,4 +8,6 @@ hud/*.exe
 hud/macos/.build/
 hud/macos/CursorUsageHud
 hud/macos/CursorUsageHud.app/
+hud/macos/CursorUsageHud.dmg
+hud/macos/.dmg-staging/
 hud/macos/.swiftpm/
