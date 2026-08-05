@@ -12,6 +12,7 @@ using System.Windows.Forms;
 static class Native
 {
     const int SQLITE_OPEN_READONLY = 1;
+    const int SQLITE_OPEN_URI = 0x40;
     const int SQLITE_ROW = 100;
     static readonly IntPtr SQLITE_TRANSIENT = new IntPtr(-1);
 
@@ -20,6 +21,9 @@ static class Native
 
     [DllImport("winsqlite3", CallingConvention = CallingConvention.Cdecl)]
     static extern int sqlite3_close_v2(IntPtr db);
+
+    [DllImport("winsqlite3", CallingConvention = CallingConvention.Cdecl)]
+    static extern int sqlite3_busy_timeout(IntPtr db, int ms);
 
     [DllImport("winsqlite3", CallingConvention = CallingConvention.Cdecl)]
     static extern int sqlite3_prepare_v2(IntPtr db, byte[] sql, int n, out IntPtr stmt, IntPtr tail);
@@ -43,9 +47,6 @@ static class Native
     public static extern IntPtr SendMessage(IntPtr h, int m, IntPtr w, IntPtr l);
 
     [DllImport("kernel32.dll")]
-    public static extern bool AllocConsole();
-
-    [DllImport("kernel32.dll")]
     public static extern bool AttachConsole(int pid);
 
     static byte[] Utf8Z(string s)
@@ -67,29 +68,16 @@ static class Native
         return Encoding.UTF8.GetString(buf);
     }
 
-    public static string ReadItem(string dbPath, string key)
+    static string QueryItem(string path, string key, bool uri)
     {
-        // Prefer a temp copy so a locked live DB still works.
-        string path = dbPath;
-        string tmp = null;
-        try
-        {
-            tmp = Path.Combine(Path.GetTempPath(), "cuh-" + Guid.NewGuid().ToString("N") + ".vscdb");
-            File.Copy(dbPath, tmp, true);
-            var wal = dbPath + "-wal";
-            var shm = dbPath + "-shm";
-            if (File.Exists(wal)) File.Copy(wal, tmp + "-wal", true);
-            if (File.Exists(shm)) File.Copy(shm, tmp + "-shm", true);
-            path = tmp;
-        }
-        catch { path = dbPath; tmp = null; }
-
         IntPtr db;
-        if (sqlite3_open_v2(Utf8Z(path), out db, SQLITE_OPEN_READONLY, IntPtr.Zero) != 0)
+        var flags = SQLITE_OPEN_READONLY | (uri ? SQLITE_OPEN_URI : 0);
+        var openPath = uri ? ("file:" + path.Replace('\\', '/') + "?mode=ro") : path;
+        if (sqlite3_open_v2(Utf8Z(openPath), out db, flags, IntPtr.Zero) != 0)
             throw new Exception("open db failed");
-
         try
         {
+            sqlite3_busy_timeout(db, 1500);
             IntPtr stmt;
             var sql = Utf8Z("SELECT value FROM ItemTable WHERE key=?");
             if (sqlite3_prepare_v2(db, sql, sql.Length, out stmt, IntPtr.Zero) != 0)
@@ -103,9 +91,28 @@ static class Native
             }
             finally { sqlite3_finalize(stmt); }
         }
+        finally { sqlite3_close_v2(db); }
+    }
+
+    public static string ReadItem(string dbPath, string key)
+    {
+        // Prefer live DB + WAL (avoids stale File.Copy snapshots).
+        try { return QueryItem(dbPath, key, true); }
+        catch { }
+
+        string tmp = null;
+        try
+        {
+            tmp = Path.Combine(Path.GetTempPath(), "cuh-" + Guid.NewGuid().ToString("N") + ".vscdb");
+            File.Copy(dbPath, tmp, true);
+            var wal = dbPath + "-wal";
+            var shm = dbPath + "-shm";
+            if (File.Exists(wal)) File.Copy(wal, tmp + "-wal", true);
+            if (File.Exists(shm)) File.Copy(shm, tmp + "-shm", true);
+            return QueryItem(tmp, key, false);
+        }
         finally
         {
-            sqlite3_close_v2(db);
             if (tmp != null)
             {
                 try { File.Delete(tmp); } catch { }
@@ -124,9 +131,13 @@ sealed class HudForm : Form
     readonly Label _msg = new Label();
     readonly Label _status = new Label();
     readonly ProgressBar _bar = new ProgressBar();
+    readonly Button _refresh = new Button();
     readonly Timer _timer = new Timer();
+    readonly Timer _debounce = new Timer();
+    FileSystemWatcher _watch;
     string _lastSub = "";
     string _db;
+    bool _busy;
 
     public HudForm()
     {
@@ -145,17 +156,28 @@ sealed class HudForm : Form
         ForeColor = Color.WhiteSmoke;
         Font = new Font("Segoe UI", 9f);
         Opacity = 0.94;
-        Padding = new Padding(10);
 
         _user.AutoSize = false;
-        _user.SetBounds(10, 8, 200, 18);
+        _user.SetBounds(10, 8, 175, 18);
         _user.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
         _user.ForeColor = Color.White;
 
         _plan.AutoSize = false;
-        _plan.SetBounds(210, 8, 60, 18);
+        _plan.SetBounds(185, 8, 50, 18);
         _plan.TextAlign = ContentAlignment.MiddleRight;
         _plan.ForeColor = Color.FromArgb(160, 160, 165);
+
+        _refresh.SetBounds(242, 5, 28, 22);
+        _refresh.Text = "R";
+        _refresh.FlatStyle = FlatStyle.Flat;
+        _refresh.FlatAppearance.BorderSize = 0;
+        _refresh.BackColor = Color.FromArgb(45, 45, 48);
+        _refresh.ForeColor = Color.WhiteSmoke;
+        _refresh.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+        _refresh.FlatAppearance.MouseOverBackColor = Color.FromArgb(70, 70, 75);
+        _refresh.Cursor = Cursors.Hand;
+        _refresh.TabStop = false;
+        _refresh.Click += (s, e) => ManualRefresh();
 
         _bar.SetBounds(10, 32, 200, 14);
         _bar.Minimum = 0;
@@ -176,19 +198,58 @@ sealed class HudForm : Form
         _status.ForeColor = Color.FromArgb(120, 120, 125);
         _status.Font = new Font("Segoe UI", 7.5f);
 
-        Controls.AddRange(new Control[] { _user, _plan, _bar, _pct, _msg, _status });
+        Controls.AddRange(new Control[] { _user, _plan, _refresh, _bar, _pct, _msg, _status });
 
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Refresh now", null, (s, e) => RefreshNow());
+        menu.Items.Add("Refresh now", null, (s, e) => ManualRefresh());
         menu.Items.Add("Exit", null, (s, e) => Close());
         ContextMenuStrip = menu;
 
         MouseDown += Drag;
-        foreach (Control c in Controls) c.MouseDown += Drag;
+        foreach (Control c in Controls)
+        {
+            if (c == _refresh) continue;
+            c.MouseDown += Drag;
+        }
 
         _timer.Interval = 60000;
-        _timer.Tick += (s, e) => RefreshNow();
-        Shown += (s, e) => { RefreshNow(); _timer.Start(); };
+        _timer.Tick += (s, e) => RefreshNow(false);
+
+        _debounce.Interval = 800;
+        _debounce.Tick += (s, e) => { _debounce.Stop(); RefreshNow(false); };
+
+        Shown += (s, e) =>
+        {
+            StartWatch();
+            RefreshNow(false);
+            _timer.Start();
+        };
+        FormClosed += (s, e) =>
+        {
+            if (_watch != null) { _watch.EnableRaisingEvents = false; _watch.Dispose(); }
+        };
+    }
+
+    void StartWatch()
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(_db);
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+            _watch = new FileSystemWatcher(dir);
+            _watch.Filter = "state.vscdb*";
+            _watch.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName;
+            FileSystemEventHandler bump = (s, e) =>
+            {
+                try { BeginInvoke(new Action(() => { _debounce.Stop(); _debounce.Start(); })); }
+                catch { }
+            };
+            _watch.Changed += bump;
+            _watch.Created += bump;
+            _watch.Renamed += (s, e) => bump(s, e);
+            _watch.EnableRaisingEvents = true;
+        }
+        catch { }
     }
 
     void Drag(object sender, MouseEventArgs e)
@@ -198,8 +259,18 @@ sealed class HudForm : Form
         Native.SendMessage(Handle, 0xA1, (IntPtr)0x2, IntPtr.Zero);
     }
 
-    void RefreshNow()
+    void ManualRefresh()
     {
+        _timer.Stop();
+        RefreshNow(true);
+        _timer.Start();
+    }
+
+    void RefreshNow(bool manual)
+    {
+        if (_busy) return;
+        _busy = true;
+        _refresh.Enabled = false;
         try
         {
             if (!File.Exists(_db))
@@ -211,38 +282,49 @@ sealed class HudForm : Form
             var jwt = Native.ReadItem(_db, "cursorAuth/accessToken");
             if (string.IsNullOrWhiteSpace(jwt))
             {
-                Fail("No accessToken — sign in to Cursor");
+                Fail("No accessToken - sign in to Cursor");
                 return;
             }
 
-            var email = Native.ReadItem(_db, "cursorAuth/cachedEmail");
             var membership = Native.ReadItem(_db, "cursorAuth/stripeMembershipType");
+            var cached = Native.ReadItem(_db, "cursorAuth/cachedEmail");
             var sub = JwtClaim(jwt, "sub");
+
+            // Email from official AuthService matches the JWT used for usage.
+            string email = "";
+            try { email = ExtractString(PostJson(jwt, "https://api2.cursor.sh/aiserver.v1.AuthService/GetEmail"), "email"); }
+            catch { }
+            if (string.IsNullOrEmpty(email)) email = cached;
             if (string.IsNullOrEmpty(email)) email = JwtClaim(jwt, "email");
             if (string.IsNullOrEmpty(email)) email = ShortSub(sub);
 
             var switched = !string.IsNullOrEmpty(sub) && _lastSub != "" && sub != _lastSub;
             _lastSub = sub ?? "";
 
-            var json = PostUsage(jwt);
+            var json = PostJson(jwt, "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage");
             var used = ParseDouble(json, "totalPercentUsed");
             var rem = Math.Max(0, Math.Min(100, 100.0 - used));
             var display = ExtractString(json, "displayMessage");
             if (string.IsNullOrEmpty(display))
                 display = string.Format("Used {0:0.#}% · Remaining {1:0.#}%", used, rem);
 
-            _user.Text = Truncate(email, 28);
+            _user.Text = Truncate(email, 26);
             _plan.Text = string.IsNullOrEmpty(membership) ? "" : membership;
             _bar.Value = (int)Math.Round(rem * 10);
             _pct.Text = string.Format("{0:0.#}%", rem);
             _pct.ForeColor = rem <= 10 ? Color.Salmon : rem <= 30 ? Color.Gold : Color.FromArgb(120, 220, 140);
             _msg.Text = Truncate(display, 42);
-            _status.Text = (switched ? "switched · " : "left=remaining · ")
-                + "next @" + DateTime.Now.AddMinutes(1).ToString("HH:mm:ss");
+            var prefix = manual ? "refreshed · " : (switched ? "switched · " : "left=remaining · ");
+            _status.Text = prefix + "next @" + DateTime.Now.AddMinutes(1).ToString("HH:mm:ss");
         }
         catch (Exception ex)
         {
             Fail(ex.Message);
+        }
+        finally
+        {
+            _busy = false;
+            _refresh.Enabled = true;
         }
     }
 
@@ -251,7 +333,7 @@ sealed class HudForm : Form
         _user.Text = "Cursor Usage";
         _plan.Text = "";
         _bar.Value = 0;
-        _pct.Text = "—";
+        _pct.Text = "-";
         _pct.ForeColor = Color.Salmon;
         _msg.Text = Truncate(msg, 42);
         _status.Text = DateTime.Now.ToString("HH:mm:ss");
@@ -259,8 +341,17 @@ sealed class HudForm : Form
 
     internal static string PostUsage(string jwt)
     {
-        var req = (HttpWebRequest)WebRequest.Create(
-            "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage");
+        return PostJson(jwt, "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage");
+    }
+
+    internal static string PostGetEmail(string jwt)
+    {
+        return PostJson(jwt, "https://api2.cursor.sh/aiserver.v1.AuthService/GetEmail");
+    }
+
+    internal static string PostJson(string jwt, string url)
+    {
+        var req = (HttpWebRequest)WebRequest.Create(url);
         req.Method = "POST";
         req.ContentType = "application/json";
         req.Headers["Authorization"] = "Bearer " + jwt;
@@ -351,7 +442,15 @@ static class Program
         {
             var jwt = Native.ReadItem(db, "cursorAuth/accessToken");
             if (string.IsNullOrWhiteSpace(jwt)) throw new Exception("no accessToken");
-            var email = Native.ReadItem(db, "cursorAuth/cachedEmail");
+            var email = "";
+            try
+            {
+                var m = Regex.Match(HudForm.PostGetEmail(jwt), "\"email\"\\s*:\\s*\"([^\"]+)\"");
+                if (m.Success) email = m.Groups[1].Value;
+            }
+            catch { }
+            if (string.IsNullOrEmpty(email))
+                email = Native.ReadItem(db, "cursorAuth/cachedEmail");
             var membership = Native.ReadItem(db, "cursorAuth/stripeMembershipType");
             var json = HudForm.PostUsage(jwt);
             var used = HudForm.ParseDouble(json, "totalPercentUsed");
