@@ -70,6 +70,70 @@ enum CursorDB {
     }
 }
 
+// MARK: - Auth (prefer AI助手 seamless_state, else IDE state.vscdb)
+
+enum CursorAuth {
+    static let sourceRenewal = "renewal"
+    static let sourceIde = "ide"
+
+    static var renewalDir: String {
+        (NSHomeDirectory() as NSString).appendingPathComponent(".cursor-renewal")
+    }
+
+    static var seamlessPath: String {
+        (renewalDir as NSString).appendingPathComponent("seamless_state.json")
+    }
+
+    struct Session {
+        var jwt: String
+        var email: String
+        var membership: String
+        var source: String
+    }
+
+    static func load() throws -> Session {
+        // 1) AI助手领号态
+        let seamless = seamlessPath
+        if FileManager.default.fileExists(atPath: seamless),
+           let data = try? Data(contentsOf: URL(fileURLWithPath: seamless)),
+           let json = String(data: data, encoding: .utf8) {
+            let jwt = CursorAPI.extractString(json, "accessToken").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !jwt.isEmpty {
+                var membership = ""
+                if FileManager.default.fileExists(atPath: CursorDB.path) {
+                    membership = (try? CursorDB.readItem(CursorDB.path, key: "cursorAuth/stripeMembershipType")) ?? ""
+                }
+                return Session(
+                    jwt: jwt,
+                    email: CursorAPI.extractString(json, "email"),
+                    membership: membership,
+                    source: sourceRenewal
+                )
+            }
+        }
+
+        // 2) Cursor IDE
+        guard FileManager.default.fileExists(atPath: CursorDB.path) else {
+            throw NSError(
+                domain: "auth",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Cursor state.vscdb not found - sign in first"]
+            )
+        }
+        let jwt = try CursorDB.readItem(CursorDB.path, key: "cursorAuth/accessToken")
+        if jwt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw NSError(
+                domain: "auth",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "No accessToken - sign in to Cursor"]
+            )
+        }
+        let email = (try? CursorDB.readItem(CursorDB.path, key: "cursorAuth/cachedEmail")) ?? ""
+        let membership = (try? CursorDB.readItem(CursorDB.path, key: "cursorAuth/stripeMembershipType")) ?? ""
+        return Session(jwt: jwt, email: email, membership: membership, source: sourceIde)
+    }
+}
+
 // MARK: - HTTP + JWT helpers
 
 enum CursorAPI {
@@ -204,9 +268,10 @@ final class HudController: NSObject, NSWindowDelegate {
     private var debounceWork: DispatchWorkItem?
     private var dirSource: DispatchSourceFileSystemObject?
     private var dirFD: Int32 = -1
+    private var renewalSource: DispatchSourceFileSystemObject?
+    private var renewalFD: Int32 = -1
     private var lastSub = ""
     private var busy = false
-    private let dbPath = CursorDB.path
 
     override init() {
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
@@ -308,26 +373,32 @@ final class HudController: NSObject, NSWindowDelegate {
     }
 
     private func startWatch() {
-        let dir = (dbPath as NSString).deletingLastPathComponent
+        startWatchDir((CursorDB.path as NSString).deletingLastPathComponent, fd: &dirFD, source: &dirSource)
+        startWatchDir(CursorAuth.renewalDir, fd: &renewalFD, source: &renewalSource)
+    }
+
+    private func startWatchDir(
+        _ dir: String,
+        fd: inout Int32,
+        source: inout DispatchSourceFileSystemObject?
+    ) {
         guard FileManager.default.fileExists(atPath: dir) else { return }
-        dirFD = open(dir, O_EVTONLY)
-        guard dirFD >= 0 else { return }
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: dirFD,
+        let opened = open(dir, O_EVTONLY)
+        guard opened >= 0 else { return }
+        fd = opened
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: opened,
             eventMask: [.write, .rename, .delete, .extend, .attrib],
             queue: .main
         )
-        source.setEventHandler { [weak self] in
+        src.setEventHandler { [weak self] in
             self?.scheduleDebouncedRefresh()
         }
-        source.setCancelHandler { [weak self] in
-            if let fd = self?.dirFD, fd >= 0 {
-                close(fd)
-                self?.dirFD = -1
-            }
+        src.setCancelHandler {
+            if opened >= 0 { close(opened) }
         }
-        dirSource = source
-        source.resume()
+        source = src
+        src.resume()
     }
 
     private func scheduleDebouncedRefresh() {
@@ -365,22 +436,12 @@ final class HudController: NSObject, NSWindowDelegate {
                 }
             }
             do {
-                guard FileManager.default.fileExists(atPath: self.dbPath) else {
-                    self.failOnMain("Cursor state.vscdb not found - sign in first")
-                    return
-                }
-                let jwt = try CursorDB.readItem(self.dbPath, key: "cursorAuth/accessToken")
-                guard !jwt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    self.failOnMain("No accessToken - sign in to Cursor")
-                    return
-                }
-                let cachedMembership = (try? CursorDB.readItem(self.dbPath, key: "cursorAuth/stripeMembershipType")) ?? ""
-                let cached = (try? CursorDB.readItem(self.dbPath, key: "cursorAuth/cachedEmail")) ?? ""
+                let session = try CursorAuth.load()
+                let jwt = session.jwt
+                var membership = session.membership
                 let sub = CursorAPI.jwtClaim(jwt, "sub")
 
-                // Prefer cachedEmail — matches Cursor IDE settings UI.
-                // GetEmail can return a different signup/Google address for the same session.
-                var email = cached
+                var email = session.email
                 if email.isEmpty {
                     if let body = try? CursorAPI.postGetEmail(jwt: jwt) {
                         email = CursorAPI.extractString(body, "email")
@@ -392,7 +453,7 @@ final class HudController: NSObject, NSWindowDelegate {
                 let switched = !sub.isEmpty && !self.lastSub.isEmpty && sub != self.lastSub
                 self.lastSub = sub
 
-                let membership = CursorAPI.resolvePlan(jwt: jwt, cachedMembership: cachedMembership)
+                membership = CursorAPI.resolvePlan(jwt: jwt, cachedMembership: membership)
                 let json = try CursorAPI.postUsage(jwt: jwt)
                 let used = CursorAPI.parseDouble(json, "totalPercentUsed")
                 let rem = max(0, min(100, 100.0 - used))
@@ -404,6 +465,7 @@ final class HudController: NSObject, NSWindowDelegate {
                 let prefix: String
                 if manual { prefix = "refreshed · " }
                 else if switched { prefix = "switched · " }
+                else if session.source == CursorAuth.sourceRenewal { prefix = "renewal · " }
                 else { prefix = "left=remaining · " }
                 let next = Date().addingTimeInterval(60)
                 let fmt = DateFormatter()
@@ -449,22 +511,20 @@ final class HudController: NSObject, NSWindowDelegate {
 // MARK: - CLI --once
 
 func runOnce() {
-    let db = CursorDB.path
     do {
-        let jwt = try CursorDB.readItem(db, key: "cursorAuth/accessToken")
-        if jwt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw NSError(domain: "cli", code: 1, userInfo: [NSLocalizedDescriptionKey: "no accessToken"])
-        }
-        var email = (try? CursorDB.readItem(db, key: "cursorAuth/cachedEmail")) ?? ""
+        let session = try CursorAuth.load()
+        let jwt = session.jwt
+        var email = session.email
         if email.isEmpty, let body = try? CursorAPI.postGetEmail(jwt: jwt) {
             email = CursorAPI.extractString(body, "email")
         }
-        let cachedMembership = (try? CursorDB.readItem(db, key: "cursorAuth/stripeMembershipType")) ?? ""
+        let cachedMembership = session.membership
         let planJSON = (try? CursorAPI.postPlanInfo(jwt: jwt)) ?? ""
         var membership = CursorAPI.extractString(planJSON, "planName").lowercased()
         if membership.isEmpty { membership = cachedMembership }
         let json = try CursorAPI.postUsage(jwt: jwt)
         let used = CursorAPI.parseDouble(json, "totalPercentUsed")
+        print("source=\(session.source)")
         print("email=\(email)")
         print("plan=\(membership)")
         print("db_stripeMembershipType=\(cachedMembership)")

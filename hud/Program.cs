@@ -123,6 +123,97 @@ static class Native
     }
 }
 
+/// <summary>
+/// Auth: prefer AI助手/cursor-renewal seamless_state.json (操作面板账号),
+/// else Cursor IDE state.vscdb.
+/// </summary>
+static class CursorAuth
+{
+    public const string SourceRenewal = "renewal";
+    public const string SourceIde = "ide";
+
+    public static string RenewalDir
+    {
+        get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cursor-renewal"); }
+    }
+
+    public static string SeamlessPath
+    {
+        get { return Path.Combine(RenewalDir, "seamless_state.json"); }
+    }
+
+    public static string IdeDbPath
+    {
+        get
+        {
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                @"Cursor\User\globalStorage\state.vscdb");
+        }
+    }
+
+    public struct Session
+    {
+        public string Jwt;
+        public string Email;
+        public string Membership;
+        public string Source; // renewal | ide
+    }
+
+    public static Session Load()
+    {
+        Session s;
+        s.Jwt = "";
+        s.Email = "";
+        s.Membership = "";
+        s.Source = SourceIde;
+
+        // 1) AI助手领号态 — matches 操作面板「当前账号」
+        try
+        {
+            var path = SeamlessPath;
+            if (File.Exists(path))
+            {
+                var json = File.ReadAllText(path, Encoding.UTF8);
+                var jwt = ExtractJsonString(json, "accessToken");
+                if (!string.IsNullOrWhiteSpace(jwt))
+                {
+                    s.Jwt = jwt.Trim();
+                    s.Email = ExtractJsonString(json, "email");
+                    s.Source = SourceRenewal;
+                    // membership still from IDE cache if present (often stale; API overrides)
+                    if (File.Exists(IdeDbPath))
+                    {
+                        try { s.Membership = Native.ReadItem(IdeDbPath, "cursorAuth/stripeMembershipType"); }
+                        catch { }
+                    }
+                    return s;
+                }
+            }
+        }
+        catch { }
+
+        // 2) Cursor IDE state.vscdb
+        if (!File.Exists(IdeDbPath))
+            throw new Exception("Cursor state.vscdb not found - sign in first");
+
+        s.Jwt = Native.ReadItem(IdeDbPath, "cursorAuth/accessToken");
+        if (string.IsNullOrWhiteSpace(s.Jwt))
+            throw new Exception("No accessToken - sign in to Cursor");
+        s.Email = Native.ReadItem(IdeDbPath, "cursorAuth/cachedEmail");
+        s.Membership = Native.ReadItem(IdeDbPath, "cursorAuth/stripeMembershipType");
+        s.Source = SourceIde;
+        return s;
+    }
+
+    static string ExtractJsonString(string json, string key)
+    {
+        var m = Regex.Match(json, "\"" + Regex.Escape(key) + "\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
+        if (!m.Success) return "";
+        return Regex.Unescape(m.Groups[1].Value);
+    }
+}
+
 sealed class HudForm : Form
 {
     readonly Label _user = new Label();
@@ -134,17 +225,13 @@ sealed class HudForm : Form
     readonly Button _refresh = new Button();
     readonly Timer _timer = new Timer();
     readonly Timer _debounce = new Timer();
-    FileSystemWatcher _watch;
+    FileSystemWatcher _watchDb;
+    FileSystemWatcher _watchRenewal;
     string _lastSub = "";
-    string _db;
     bool _busy;
 
     public HudForm()
     {
-        _db = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            @"Cursor\User\globalStorage\state.vscdb");
-
         Text = "Cursor Usage";
         FormBorderStyle = FormBorderStyle.None;
         TopMost = true;
@@ -226,28 +313,55 @@ sealed class HudForm : Form
         };
         FormClosed += (s, e) =>
         {
-            if (_watch != null) { _watch.EnableRaisingEvents = false; _watch.Dispose(); }
+            DisposeWatch(ref _watchDb);
+            DisposeWatch(ref _watchRenewal);
         };
+    }
+
+    static void DisposeWatch(ref FileSystemWatcher w)
+    {
+        if (w == null) return;
+        try { w.EnableRaisingEvents = false; w.Dispose(); } catch { }
+        w = null;
     }
 
     void StartWatch()
     {
+        FileSystemEventHandler bump = (s, e) =>
+        {
+            try { BeginInvoke(new Action(() => { _debounce.Stop(); _debounce.Start(); })); }
+            catch { }
+        };
+
         try
         {
-            var dir = Path.GetDirectoryName(_db);
-            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
-            _watch = new FileSystemWatcher(dir);
-            _watch.Filter = "state.vscdb*";
-            _watch.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName;
-            FileSystemEventHandler bump = (s, e) =>
+            var dbDir = Path.GetDirectoryName(CursorAuth.IdeDbPath);
+            if (!string.IsNullOrEmpty(dbDir) && Directory.Exists(dbDir))
             {
-                try { BeginInvoke(new Action(() => { _debounce.Stop(); _debounce.Start(); })); }
-                catch { }
-            };
-            _watch.Changed += bump;
-            _watch.Created += bump;
-            _watch.Renamed += (s, e) => bump(s, e);
-            _watch.EnableRaisingEvents = true;
+                _watchDb = new FileSystemWatcher(dbDir);
+                _watchDb.Filter = "state.vscdb*";
+                _watchDb.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName;
+                _watchDb.Changed += bump;
+                _watchDb.Created += bump;
+                _watchDb.Renamed += (s, e) => bump(s, e);
+                _watchDb.EnableRaisingEvents = true;
+            }
+        }
+        catch { }
+
+        try
+        {
+            var renewalDir = CursorAuth.RenewalDir;
+            if (Directory.Exists(renewalDir))
+            {
+                _watchRenewal = new FileSystemWatcher(renewalDir);
+                _watchRenewal.Filter = "seamless_state.json";
+                _watchRenewal.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName;
+                _watchRenewal.Changed += bump;
+                _watchRenewal.Created += bump;
+                _watchRenewal.Renamed += (s, e) => bump(s, e);
+                _watchRenewal.EnableRaisingEvents = true;
+            }
         }
         catch { }
     }
@@ -273,26 +387,14 @@ sealed class HudForm : Form
         _refresh.Enabled = false;
         try
         {
-            if (!File.Exists(_db))
-            {
-                Fail("Cursor state.vscdb not found - sign in first");
-                return;
-            }
-
-            var jwt = Native.ReadItem(_db, "cursorAuth/accessToken");
-            if (string.IsNullOrWhiteSpace(jwt))
-            {
-                Fail("No accessToken - sign in to Cursor");
-                return;
-            }
-
-            var membership = Native.ReadItem(_db, "cursorAuth/stripeMembershipType");
-            var cached = Native.ReadItem(_db, "cursorAuth/cachedEmail");
+            var session = CursorAuth.Load();
+            var jwt = session.Jwt;
+            var membership = session.Membership;
             var sub = JwtClaim(jwt, "sub");
 
-            // Prefer cachedEmail — matches Cursor IDE settings UI.
-            // GetEmail can return a different signup/Google address for the same session.
-            string email = cached;
+            // Email: seamless email (renewal) or cachedEmail (ide) already loaded;
+            // then GetEmail → JWT email → sub.
+            string email = session.Email;
             if (string.IsNullOrEmpty(email))
             {
                 try { email = ExtractString(PostJson(jwt, "https://api2.cursor.sh/aiserver.v1.AuthService/GetEmail"), "email"); }
@@ -325,7 +427,11 @@ sealed class HudForm : Form
             _pct.Text = string.Format("{0:0.#}%", rem);
             _pct.ForeColor = rem <= 10 ? Color.Salmon : rem <= 30 ? Color.Gold : Color.FromArgb(120, 220, 140);
             _msg.Text = Truncate(display, 42);
-            var prefix = manual ? "refreshed · " : (switched ? "switched · " : "left=remaining · ");
+            string prefix;
+            if (manual) prefix = "refreshed · ";
+            else if (switched) prefix = "switched · ";
+            else if (session.Source == CursorAuth.SourceRenewal) prefix = "renewal · ";
+            else prefix = "left=remaining · ";
             _status.Text = prefix + "next @" + DateTime.Now.AddMinutes(1).ToString("HH:mm:ss");
         }
         catch (Exception ex)
@@ -446,14 +552,11 @@ static class Program
         }
         catch { }
 
-        var db = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            @"Cursor\User\globalStorage\state.vscdb");
         try
         {
-            var jwt = Native.ReadItem(db, "cursorAuth/accessToken");
-            if (string.IsNullOrWhiteSpace(jwt)) throw new Exception("no accessToken");
-            var email = Native.ReadItem(db, "cursorAuth/cachedEmail");
+            var session = CursorAuth.Load();
+            var jwt = session.Jwt;
+            var email = session.Email;
             if (string.IsNullOrEmpty(email))
             {
                 try
@@ -463,7 +566,7 @@ static class Program
                 }
                 catch { }
             }
-            var cachedMembership = Native.ReadItem(db, "cursorAuth/stripeMembershipType");
+            var cachedMembership = session.Membership;
             var membership = cachedMembership;
             var planJson = "";
             try
@@ -475,6 +578,7 @@ static class Program
             catch { }
             var json = HudForm.PostUsage(jwt);
             var used = HudForm.ParseDouble(json, "totalPercentUsed");
+            Console.WriteLine("source=" + session.Source);
             Console.WriteLine("email=" + email);
             Console.WriteLine("plan=" + membership);
             Console.WriteLine("db_stripeMembershipType=" + cachedMembership);

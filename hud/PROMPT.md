@@ -13,15 +13,26 @@
 做一个始终置顶的浮动小窗，读取本机 Cursor IDE 登录态，调用官方用量 API，
 显示当前账号邮箱、套餐、剩余用量百分比。无需用户手动填 JWT。
 
-## 数据源（本地 SQLite）
-Cursor 把登录态存在 state.vscdb（ItemTable key/value）：
+## 数据源（双路径；优先 AI助手「领号」态）
+
+本机可能同时存在两套 Cursor 登录态，且经常不一致：
+
+| 优先级 | 来源 | 路径 | 说明 |
+|--------|------|------|------|
+| 1（优先） | AI助手 / cursor-renewal「领号」 | `~/.cursor-renewal/seamless_state.json` | 操作面板「当前账号」；含 email + accessToken + refreshToken |
+| 2（回退） | Cursor IDE 登录缓存 | `state.vscdb` ItemTable | IDE 设置页账号；可被领号工具改写，也可能与 seamless 不同步 |
+
+`seamless_state.json` 字段：`email`、`accessToken`、`refreshToken`、`auto_switch_enabled`、`machineIds`。  
+号池远程源（仅文档记录，HUD 不调用）：`https://vaultbyte.top` → `/api/v2/cursor/credentials`。
+
+### Cursor IDE DB（回退）
 
 - macOS: ~/Library/Application Support/Cursor/User/globalStorage/state.vscdb
 - Windows: %APPDATA%\Cursor\User\globalStorage\state.vscdb
 
 必读 key：
 - cursorAuth/accessToken          → JWT（Bearer）
-- cursorAuth/cachedEmail         → 邮箱（优先，与 IDE 设置页一致）
+- cursorAuth/cachedEmail         → 邮箱（与 IDE 设置页一致）
 - cursorAuth/stripeMembershipType → 本地缓存套餐（常过期，仅作回退）
 
 读库策略（很重要）：
@@ -29,6 +40,12 @@ Cursor 把登录态存在 state.vscdb（ItemTable key/value）：
 2. live 失败再复制 db + 同名 -wal/-shm 到临时文件再查
 3. busy_timeout ≈ 1500ms
 4. SQL: SELECT value FROM ItemTable WHERE key=?
+
+HUD 读 JWT / 邮箱策略：
+1. 若 `~/.cursor-renewal/seamless_state.json` 存在且 `accessToken` 非空 → 用该 JWT；邮箱优先用文件内 `email`
+2. 否则读 `state.vscdb` 的 `cursorAuth/accessToken`；邮箱优先 `cachedEmail`
+3. 再空则 GetEmail → JWT `email` → JWT `sub` 截短
+4. 监视两个目录变更（debounce 800ms）：`.cursor-renewal` 与 `state.vscdb` 所在目录
 
 ## 官方 API（全部 POST，Body 为 {}，Header: Authorization: Bearer <jwt>，Content-Type: application/json）
 Base: https://api2.cursor.sh
@@ -45,7 +62,7 @@ Base: https://api2.cursor.sh
    - 仅当 cachedEmail 为空时使用；GetEmail 可能返回与 IDE 不一致的注册/Google 邮箱
 
 邮箱解析优先级：
-cachedEmail → GetEmail → JWT claim "email" → JWT claim "sub" 截短（取 | 后一段）
+seamless_state.email（若走领号态）→ cachedEmail → GetEmail → JWT claim "email" → JWT claim "sub" 截短（取 | 后一段）
 
 JWT：手动 Base64URL 解码 payload，不引入 JWT 库。
 
@@ -64,9 +81,9 @@ JWT：手动 Base64URL 解码 payload，不引入 JWT 库。
 
 ## 刷新逻辑
 - 启动立即刷新；之后每 60s 轮询
-- 监视 state.vscdb 所在目录变更，debounce 800ms 后再刷新（切换账号时能跟上）
+- 监视 `.cursor-renewal` 与 state.vscdb 所在目录变更，debounce 800ms 后再刷新
 - 用 JWT sub 检测账号切换；切换时状态前缀为 "switched · "
-- 手动刷新前缀 "refreshed · "；常规 "left=remaining · "
+- 手动刷新前缀 "refreshed · "；领号态常规 "renewal · "；IDE 回退 "left=remaining · "
 - 刷新期间禁用 R 按钮，防重入
 - 失败时：标题变 "Cursor Usage"，百分比 "-"，消息显示错误摘要
 
@@ -97,13 +114,18 @@ JWT：手动 Base64URL 解码 payload，不引入 JWT 库。
 | 窗口 | 280×92，置顶，可拖动，无任务栏/Dock 图标 |
 | 进度条含义 | **剩余**用量（非已用） |
 | 套餐权威源 | `GetPlanInfo.planName` |
-| 邮箱权威源 | `cursorAuth/cachedEmail` |
+| 邮箱权威源 | 优先 `~/.cursor-renewal/seamless_state.json` 的 `email`，否则 `cursorAuth/cachedEmail` |
+| JWT 权威源 | 优先 `seamless_state.accessToken`，否则 `cursorAuth/accessToken` |
 | 用量权威源 | `GetCurrentPeriodUsage.totalPercentUsed` |
 
-### 本地 DB 路径
+### 本地路径
 
-| OS | Path |
-|----|------|
+| OS | 领号态 (优先) | Cursor IDE DB (回退) |
+|----|---------------|----------------------|
+| macOS / Windows | `~/.cursor-renewal/seamless_state.json` | 见下表 `state.vscdb` |
+
+| OS | state.vscdb |
+|----|-------------|
 | macOS | `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` |
 | Windows | `%APPDATA%\Cursor\User\globalStorage\state.vscdb` |
 
@@ -152,11 +174,12 @@ cd hud
 
 1. **WAL**：Cursor 写库走 WAL，只复制 `.vscdb` 会读到旧 token；优先 live 只读 / 连带复制 `-wal`/`-shm`。
 2. **套餐缓存脏**：`stripeMembershipType` 经常过期，必须打 `GetPlanInfo`。
-3. **邮箱不一致**：`GetEmail` 可能和 IDE 设置页不同，优先 `cachedEmail`。
-4. **macOS App Bundle**：AppKit GUI 必须打进 `.app`（`Info.plist` + `LSUIElement=true`），并 ad-hoc `codesign`；否则双击启动会被系统杀掉。
-5. **Gatekeeper**：adhoc 签名的 DMG 分发给别人时，对方可能需右键 → 打开，或 `xattr -cr …app`。
-6. **架构**：当前 macOS 默认构建多为 arm64；要兼容 Intel 需单独做 universal。
-7. **与 Gateway 无关**：HUD 自己读 JWT 调 api2，不依赖 `localhost:4647`。
+3. **邮箱不一致**：`GetEmail` 可能和 IDE 设置页不同；有领号工具时，IDE `cachedEmail` 还可能与 `seamless_state.email` 不是同一账号（例如 IDE 显示被注入号，操作面板仍是领到的号）——HUD 优先 seamless。
+4. **AI助手写盘**：`AI助手-*.exe`（`cursor-renewal` / `com.cursor-renewal.app`）会把领到的 JWT 写入 `~/.cursor-renewal/`，并可能再 `INSERT OR REPLACE` 进 `state.vscdb` 的 `cursorAuth/*`，同时改机器指纹 / 补丁 Cursor `main.js` 等；**不是**依赖 Frida 改 UI 显示。
+5. **macOS App Bundle**：AppKit GUI 必须打进 `.app`（`Info.plist` + `LSUIElement=true`），并 ad-hoc `codesign`；否则双击启动会被系统杀掉。
+6. **Gatekeeper**：adhoc 签名的 DMG 分发给别人时，对方可能需右键 → 打开，或 `xattr -cr …app`。
+7. **架构**：当前 macOS 默认构建多为 arm64；要兼容 Intel 需单独做 universal。
+8. **与 Gateway 无关**：HUD 自己读 JWT 调 api2，不依赖 `localhost:4647`。
 
 ---
 
@@ -166,6 +189,7 @@ cd hud
 - [ ] 已登录时显示邮箱、套餐、剩余 %
 - [ ] `--once` 能打印 JSON
 - [ ] 60s 自动刷新；点 R 立即刷新
-- [ ] 切换 Cursor 账号后（或改写 state.vscdb）能在约 1s 内跟上
+- [ ] 切换账号后（改写 seamless_state.json 或 state.vscdb）能在约 1s 内跟上
+- [ ] 存在 `~/.cursor-renewal/seamless_state.json` 时优先用其 email/JWT（与操作面板一致）
 - [ ] 百分比颜色随分档变化；进度条表示剩余
 - [ ] 右键可退出；无 Dock/任务栏常驻图标

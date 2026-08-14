@@ -121,7 +121,11 @@ curl -sN http://localhost:4647/v1/chat/completions \
 
 ## Usage HUD
 
-Floating overlay that reads the live Cursor session DB and refreshes usage about every 60s. Shows email, plan, and remaining usage percent.
+Floating overlay that refreshes usage about every 60s. Shows email, plan, and remaining usage percent.
+
+Auth priority (see `hud/PROMPT.md`):
+1. `~/.cursor-renewal/seamless_state.json` — AI助手 / cursor-renewal「领号」态（操作面板当前账号）
+2. Cursor IDE `state.vscdb` — `cursorAuth/accessToken` + `cachedEmail`（回退）
 
 ### macOS
 
@@ -149,7 +153,8 @@ Requires .NET (WinForms).
 ```powershell
 cd hud
 .\build.ps1
-# Run the produced CursorUsageHud.exe
+.\CursorUsageHud.exe --once   # CLI: prints source=renewal|ide
+.\CursorUsageHud.exe          # GUI
 ```
 
 ## Scripts
