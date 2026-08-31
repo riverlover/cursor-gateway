@@ -170,6 +170,7 @@ npm start        # node dist/index.js
 - JWT and Agent CLI logins are **separate**. Refresh usage with a valid `CURSOR_JWT`; chat needs a logged-in agent CLI.
 - Prefer binding to localhost only; do not expose the gateway publicly with your session token.
 - For a deeper dive into Cursor’s dual auth model and internals, see [`CURSOR-GATEWAY-README.md`](./CURSOR-GATEWAY-README.md).
+- For dsh / OpenAI `tools`+`tool_calls` feasibility, CLI vs api2 insertion points, and a Cursor-To-OpenAI smoke-test write-up (exploration failed on chat, conclusions kept), see [`docs/exploration-dsh-tools-and-cursor-to-openai.md`](./docs/exploration-dsh-tools-and-cursor-to-openai.md).
 
 ## License
 
