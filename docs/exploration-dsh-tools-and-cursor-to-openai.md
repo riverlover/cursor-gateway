@@ -101,12 +101,28 @@ dsh（`llm-pi-ai`）工具由 **客户端本地执行**；模型 API 只需输�
 
 ---
 
+### 2.6 cursor2api 试跑（[7836246/cursor2api](https://github.com/7836246/cursor2api)）
+
+- Clone：`d:\vscode\cursor2api`（v2.7.8，MIT）
+- **接入点不同**：代理的是 **Cursor 文档站免费对话** `https://cursor.com/api/chat`，不是 `api2` IDE Chat，也不是 Agent CLI
+- README 已标注：`20260401 Cursor文档页仅剩 gemini-3-flash（凉）`
+- 对外鉴权：本机 `auth` 设为 open 时可无 SK；上游可选 `CURSOR_COOKIE`（关键多为 `_vcrcs` Vercel 挑战），**不是**本仓那种「必须 CURSOR_JWT」模型
+- 启动：`PORT=3012`，`node --import tsx src/index.ts`（本环境 `npx`/`npm` script 会 `EACCES`）
+- `GET /v1/models`：**HTTP 200**（本地静态列表，含 `google/gemini-3-flash` 等）
+- `POST /v1/chat/completions`：**HTTP 500** — 上游返回 Next.js「This page couldn’t load」HTML  
+  - 无 cookie 与带 IDE JWT 拼的 `WorkosCursorSessionToken` 均失败  
+  - 未再起 stealth-proxy（需 Playwright Chromium，成本高且文档 API 本身可能已废）
+
+**结论**：cursor2api 对 dsh  theoretically 更友好（自带工具桥接/截断续写等），但 **当前上游 docs `/api/chat` 不可用**；有 token 不够，缺的是活的免费文档 API（或可用的 `_vcrcs` + stealth，仍取决于上游是否还开着）。与 Cursor-To-OpenAI、本仓 CLI 是 **三条不同上游**。
+
+---
+
 ## 4. 实用建议
 
 1. **接 ZCode / 只聊天**：本仓 `BASE_URL=http://localhost:4647/v1`，`API_KEY=no-key`，够用。  
-2. **接 dsh 当编码 agent**：当前不够；需 tool_calls 桥或换上游；Cursor-To-OpenAI 现状不能当生产后端。  
+2. **接 dsh 当编码 agent**：当前不够；需 tool_calls 桥或换上游；Cursor-To-OpenAI / cursor2api 现状都不能当生产后端。  
 3. **本机 Windows**：确认 `agent` 在 PATH 且 `agent whoami` 通过，本仓 chat 才有真实后端。  
-4. **合规**：逆向 api2 有风控与 ToS 风险；优先官方 CLI / API Key / SDK。
+4. **合规**：逆向 api2 / 文档免费 API 均有风控与 ToS 风险；优先官方 CLI / API Key / SDK。
 
 ---
 
@@ -114,6 +130,7 @@ dsh（`llm-pi-ai`）工具由 **客户端本地执行**；模型 API 只需输�
 
 - [ ] 本仓实现 OpenAI `tools` / `tool_calls` prompt 桥（ask 模式）并做 dsh 联调  
 - [ ] 跟踪更新的 Cursor-To-OpenAI / patched fork 协议是否恢复 chat  
+- [ ] 若文档 API 恢复：再试 cursor2api + stealth-proxy（`_vcrcs`）  
 - [ ] 评估官方 `@cursor/sdk` 是否满足「代理」以外的自动化场景（仍非裸 tools API）
 
 ---
